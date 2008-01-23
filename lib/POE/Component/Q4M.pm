@@ -1,10 +1,16 @@
+# $Id: /mirror/perl/POE-Component-Q4M/trunk/lib/POE/Component/Q4M.pm 39722 2008-01-23T00:28:27.355696Z daisuke  $
+#
+# Copyright (c) 2008 Daisuke Maki <daisuke@endeworks.jp>
+# All rights reserved.
+
 package POE::Component::Q4M;
 use strict;
 use warnings;
 use base qw(Class::Accessor::Fast);
 use POE qw(Component::EasyDBI);
 use UNIVERSAL::require;
-our $VERSION = '0.00001';
+use constant DEBUG => 0;
+our $VERSION = '0.00002';
 
 __PACKAGE__->mk_accessors($_) for qw(alias connect_info database table sql_maker backend);
 
@@ -13,7 +19,7 @@ sub spawn
     my $class = shift;
     my %args  = @_;
 
-    my $alias = $args{alias} || 'Q4M';
+    my $alias = $args{alias} || join('-', 'Q4m', $$, rand(), time());
     my $connect_info = $args{connect_info} || die "no connect_info specified";
     my $table = $args{table} || die "No table specified";
 
@@ -44,8 +50,9 @@ sub spawn
         object_states => [
             $self => {
                 _start => '_poe_start',
-                'next' => '_poe_next',
-                'fetchrow_hashref' => '_poe_fetchrow_hashref',
+                _stop  => '_poe_stop',
+                map { ($_ => "_poe_$_") }
+                    qw(next insert insert_done fetchrow_hashref)
             }
         ]
     );
@@ -55,12 +62,46 @@ sub _poe_start
 {
     my ($self, $kernel) = @_[OBJECT, KERNEL];
 
-    $kernel->alias_set($self->alias);
+    DEBUG and warn "Starting " . $self->alias;
+    $kernel->alias_set($self->alias) if $self->alias;
+}
+
+sub _poe_stop
+{
+    my ($self, $kernel) = @_[OBJECT, KERNEL];
+
+    DEBUG and warn "Stopping " . $self->alias;
+    $kernel->alias_remove( $self->alias ) if $self->alias;
+}
+
+sub _poe_insert
+{
+    my ($self, $kernel, $fieldvals) = @_[OBJECT, KERNEL, ARG0];
+
+    my($stmt, @binds) = $self->sql_maker->insert( $self->table,  $fieldvals );
+    $kernel->post($self->backend,
+        insert => {
+            sql => $stmt,
+            placeholders => \@binds,
+            event => 'insert_done',
+        }
+    ) or die;
+}
+
+sub _poe_insert_done
+{
+    DEBUG and warn "Inserted new item";
 }
 
 sub _poe_next
 {
-    my ($self, $kernel, $session, $ref) = @_[OBJECT, KERNEL, SESSION, ARG0];
+    my ($self, $kernel, $session, $ref, $heap) = @_[OBJECT, KERNEL, SESSION, ARG0, HEAP];
+
+    if ($heap->{next_pending}) {
+        return;
+    }
+
+    $heap->{next_pending}++;
 
     $ref->{sender} = $_[SENDER]->ID;
     my $postback = $session->postback(
@@ -68,11 +109,9 @@ sub _poe_next
         $ref
     );
     my $full_table = join('.', $self->database, $self->table);
-warn "calling queue_wait (" . $self->backend . " -> $full_table)";
     $kernel->post($self->backend,
         do => {
-            sql          => "SELECT queue_wait(?)",
-            placeholders => [ $full_table ],
+            sql          => qq|SELECT queue_wait("$full_table")|,
             event        => $postback,
         }
     ) or die;
@@ -80,23 +119,22 @@ warn "calling queue_wait (" . $self->backend . " -> $full_table)";
 
 sub _poe_fetchrow_hashref
 {
-    my ($self, $kernel, $pack) = @_[OBJECT, KERNEL, ARG0];
-warn "fetchrow_hashref";
+    my ($self, $kernel, $pack, $heap) = @_[OBJECT, KERNEL, ARG0, HEAP];
 
+    $heap->{next_pending}--;
     my $ref = $pack->[0];
     my ($stmt, @binds) = $self->sql_maker->select(
         $self->table,
         $ref->{fields},
     );
-    $kernel->post($self->backend,
-        hash => {
-            sql => $stmt,
-#            placeholders => \@binds,
-            event => $ref->{event},
-            session => $ref->{sender}
-        }
+
+    my %hashargs = (
+        %$ref,
+        sql => $stmt,
     );
-            
+    $kernel->post($self->backend,
+        hash => \%hashargs
+    ) or die "failed to post to 'hash'";
 }
 
 1;

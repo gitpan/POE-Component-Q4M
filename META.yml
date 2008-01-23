@@ -16,4 +16,4 @@ no_index:
 requires: 
   POE: 0
   POE::Component::EasyDBI: 0
-version: 0.00001
+version: 0.00002
